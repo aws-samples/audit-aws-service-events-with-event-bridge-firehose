@@ -1,0 +1,211 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Audit AWS service events with EventBridge and Amazon Kinesis Data Firehose
+Resources:
+  # The curated s3 bucket to store all the events data
+  CuratedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: TRUE
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: TRUE
+        BlockPublicPolicy: TRUE
+        IgnorePublicAcls: TRUE
+        RestrictPublicBuckets: TRUE
+    DeletionPolicy: Retain
+
+  # S3 Write role for Firehose to write curated data
+  FirehoseS3WriteRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - firehose.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: FirehoseS3Write
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt "CuratedBucket.Arn"
+                  - !Sub "${CuratedBucket.Arn}/*"
+
+  # EventBridge event bus rule IAM role to put records to firehose
+  EventBusRoleForFirehosePut:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: FirehosePut
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - firehose:PutRecord
+                  - firehose:PutRecordBatch
+                Resource:
+                  - !GetAtt "DeliveryStream.Arn"
+
+  # Firehose delivery stream
+  DeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamType: DirectPut
+      DeliveryStreamEncryptionConfigurationInput:
+        KeyType: AWS_OWNED_CMK
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt CuratedBucket.Arn
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 128
+        CompressionFormat: GZIP
+        ErrorOutputPrefix: errors/
+        Prefix: "!{partitionKeyFromQuery:detailType}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/"
+        RoleARN: !GetAtt FirehoseS3WriteRole.Arn
+        DynamicPartitioningConfiguration:
+          RetryOptions:
+            DurationInSeconds: 60
+          Enabled: TRUE
+        ProcessingConfiguration:
+          Enabled: TRUE
+          Processors:
+            - Type: "MetadataExtraction"
+              Parameters:
+                - ParameterName: "MetadataExtractionQuery"
+                  ParameterValue: "{detailType:.\"detail-type\"}"
+                - ParameterName: "JsonParsingEngine"
+                  ParameterValue: "JQ-1.6"
+
+  # Amazon EventBridge eventbus rule on default bus to forward all service events to Firehose
+  EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Forward all AWS service events from default event bus to Kinesis Data Firehose"
+      EventBusName: "default"
+      EventPattern: { "account": [ !Ref AWS::AccountId ] }
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt DeliveryStream.Arn
+          Id: "FirehoseDelivery"
+          RoleArn: !GetAtt EventBusRoleForFirehosePut.Arn
+
+  # Glue data catalog database
+  EventsDB:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Description: "Glue database for Amazon EventBridge default eventbus messages on s3"
+
+  # IAM role for glue crawler to auto discover schema of events on s3
+  GlueCrawlerRoleForS3Read:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: GlueCrawlerPolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt "CuratedBucket.Arn"
+                  - !Sub "${CuratedBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*"
+              - Effect: Allow
+                Action:
+                  - "glue:GetDatabase"
+                  - "glue:GetTable"
+                  - "glue:CreateTable"
+                  - "glue:UpdateTable"
+                  - "glue:DeleteTableVersion"
+                  - "glue:BatchDeleteTableVersion"
+                  - "glue:BatchDeleteTable"
+                  - "glue:DeleteTable"
+                  - "glue:GetPartition"
+                  - "glue:BatchGetPartition"
+                  - "glue:BatchCreatePartition"
+                  - "glue:CreatePartition"
+                  - "glue:UpdatePartition"
+                  - "glue:BatchDeletePartition"
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${EventsDB}"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${EventsDB}/*"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:tableVersion/${EventsDB}/*/*"
+
+  # Glue crawler to auto discover schema for all events ingested to S3
+  S3EventDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      DatabaseName: !Ref EventsDB
+      Role: !GetAtt GlueCrawlerRoleForS3Read.Arn
+      Configuration: "{ \"Version\": 1.0, \"Grouping\": { \"TableLevelConfiguration\": 2 } }"
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${CuratedBucket}/"
+
+  # Athena query to search events from parameter_store_change
+  QueryParameterStoreEvents:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref EventsDB
+      Description: Query AWS Systems Manager Parameter Store events
+      QueryString:
+        Fn::Sub: |
+          SELECT *
+          FROM "AwsDataCatalog"."${EventsDB}"."parameter_store_change"
+      Name: Blog - Query Parameter Store Events
+
+Outputs:
+  CreateParameter:
+    Description: Click here to create new parameter in AWS Systems Manager parameter store
+    Value:
+      Fn::Sub: https://console.aws.amazon.com/systems-manager/parameters/create?region=${AWS::Region}&tab=Table
+  CuratedBucket:
+    Description: Click here to see output files delivered to the S3 bucket
+    Value:
+      Fn::Sub: https://s3.console.aws.amazon.com/s3/buckets/${CuratedBucket}?region=${AWS::Region}&tab=objects
+  AthenaQueries:
+    Description: View Athena queries
+    Value:
+      Fn::Sub: https://console.aws.amazon.com/athena/saved-queries/home?force&region=${AWS::Region}
