@@ -1,7 +1,7 @@
 ## Audit AWS account events with Amazon EventBridge and Kinesis Data Firehose
 This repository contains sample code for building pipeline inesting AWS account events from Amazon EventBridge to Amazon S3 using Kinesis Data Firehose.
 
-[This post]() shows how customers can ingest & query AWS account level events coming from all AWS services using Amazon EventBridge and Kinesis Data Firehose for long term archival and query purpose.
+[This blog post](https://aws.amazon.com/blogs/big-data/audit-aws-service-events-with-amazon-eventbridge-and-amazon-kinesis-data-firehose/) shows how customers can ingest & query AWS account level events coming from all AWS services using Amazon EventBridge and Kinesis Data Firehose for long term archival and query purpose.
 
 ### Technical Solution
 1. Amazon EventBridge has default event bus where all AWS service event is published by default
